@@ -8,19 +8,11 @@
 
 1. `node server.js`
 2. 打开 `http://localhost:4173`
-3. 如需启用真实模型推理，复制 `.env.example` 并配置 `OPENAI_API_KEY` 或 `ANTHROPIC_API_KEY`
-
-### 中国 + 尽量免费配置建议
-
-优先顺序建议：
-
-1. **本地 Ollama + Qwen（免费）**  
-   - 安装 Ollama 后拉取模型：`ollama pull qwen2.5:7b-instruct`
-   - `.env` 设置：`OLLAMA_MODEL=qwen2.5:7b-instruct`
-2. **OpenAI-compatible 国内接口（低成本）**  
-   - 例如通义千问兼容接口或 DeepSeek 兼容接口
-   - 通过 `OPENAI_BASE_URL + OPENAI_API_KEY + OPENAI_MODEL` 接入
-3. **Anthropic 兜底（可选）**
+3. 必须配置真实通义密钥，否则接口会拒绝给出模板化建议：
+   - 复制 `.env.example` 为 `.env`
+   - 在阿里云百炼控制台创建 API-KEY
+   - 填写 `DASHSCOPE_API_KEY=sk-...`
+   - 默认模型 `qwen-plus`，并开启 `ENABLE_WEB_SEARCH=true`
 
 可用诊断接口：
 

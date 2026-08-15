@@ -1,12 +1,16 @@
 const http = require("http");
+const dns = require("dns");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
 
+dns.setDefaultResultOrder("ipv4first");
+
 const ROOT = process.cwd();
 const DATA_DIR = process.env.DATA_DIR || (process.env.VERCEL ? path.join("/tmp", "heigen-data") : path.join(ROOT, "data"));
 const STORE_PATH = path.join(DATA_DIR, "store.json");
+const SKILL_DIR = path.join(ROOT, "skills", "heigen-advisor");
 
 function loadDotEnv() {
   const envPath = path.join(ROOT, ".env");
@@ -23,13 +27,34 @@ function loadDotEnv() {
 }
 
 loadDotEnv();
+
+function isUsableSecret(value) {
+  if (!value || typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (trimmed.length < 16) return false;
+  if (/[【】]/.test(trimmed)) return false;
+  if (/(必填|可选|your[-_ ]?api[-_ ]?key|placeholder|changeme|example|xxx+)/i.test(trimmed)) return false;
+  return true;
+}
+
+function envFlag(name, fallback = false) {
+  const raw = (process.env[name] || "").trim().toLowerCase();
+  if (!raw) return fallback;
+  return !["0", "false", "off", "no"].includes(raw);
+}
+
 const PORT = Number(process.env.PORT || 4173);
 const INTEL_MAX_ITEMS = Number(process.env.INTEL_MAX_ITEMS || 8);
-const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN || "";
-const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
+const X_BEARER_TOKEN = isUsableSecret(process.env.X_BEARER_TOKEN) ? process.env.X_BEARER_TOKEN.trim() : "";
+const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/+$/, "");
 const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "";
-const MODEL_PROVIDER_ORDER = (process.env.MODEL_PROVIDER_ORDER || "ollama,openai,anthropic")
+const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || "").trim();
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "qwen-plus";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest";
+const ENABLE_WEB_SEARCH = envFlag("ENABLE_WEB_SEARCH", true);
+const DASHSCOPE_KEY = [process.env.DASHSCOPE_API_KEY, process.env.OPENAI_API_KEY].find(isUsableSecret) || "";
+const ANTHROPIC_KEY = isUsableSecret(process.env.ANTHROPIC_API_KEY) ? process.env.ANTHROPIC_API_KEY.trim() : "";
+const MODEL_PROVIDER_ORDER = (process.env.MODEL_PROVIDER_ORDER || "openai")
   .split(",")
   .map((item) => item.trim().toLowerCase())
   .filter(Boolean);
@@ -39,6 +64,7 @@ const SOURCE_TIERS = [
   { tier: 2, type: "database", label: "行业数据库", weight: 0.85, reliability: "high" },
   { tier: 3, type: "news", label: "新闻媒体", weight: 0.72, reliability: "medium" },
   { tier: 4, type: "social", label: "社交信号", weight: 0.45, reliability: "low" },
+  { tier: 5, type: "curated", label: "人工策展入口", weight: 0.35, reliability: "low" },
 ];
 
 const MIME_TYPES = {
@@ -49,9 +75,16 @@ const MIME_TYPES = {
   ".md": "text/markdown; charset=utf-8",
 };
 
-const defaultStore = () => ({ sessions: [] });
+const VERDICT_LABELS = {
+  kill: "否决",
+  pivot: "转向",
+  narrow: "强制收窄",
+  proceed: "有条件推进",
+};
 
+const defaultStore = () => ({ sessions: [] });
 let storeWriteQueue = Promise.resolve();
+const skillCache = { loaded: false, skill: "", validation: "", questions: "", bp: "", pitch: "" };
 
 function nowIso() {
   return new Date().toISOString();
@@ -59,6 +92,25 @@ function nowIso() {
 
 function makeId(prefix) {
   return `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
+}
+
+function readSkillFile(relativePath) {
+  try {
+    return fs.readFileSync(path.join(SKILL_DIR, relativePath), "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function loadSkillCache() {
+  if (skillCache.loaded) return skillCache;
+  skillCache.skill = readSkillFile("SKILL.md");
+  skillCache.validation = readSkillFile("references/idea-validation-frameworks.md");
+  skillCache.questions = readSkillFile("references/judge-question-bank.md");
+  skillCache.bp = readSkillFile("assets/business-plan-template.md");
+  skillCache.pitch = readSkillFile("assets/pitch-script-template.md");
+  skillCache.loaded = true;
+  return skillCache;
 }
 
 async function ensureStore() {
@@ -128,7 +180,7 @@ async function parseBody(req) {
       if (!raw.trim()) return resolve({});
       try {
         resolve(sanitizePayload(JSON.parse(raw)));
-      } catch (error) {
+      } catch {
         reject(new Error("JSON 格式错误"));
       }
     });
@@ -175,11 +227,19 @@ function toIsoDate(value) {
   return Number.isNaN(date.getTime()) ? "" : date.toISOString();
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Heigen-Adviser/1.1 (startup research; +http://localhost)",
+        Accept: "application/json, application/xml, text/xml, */*",
+        ...(options.headers || {}),
+      },
+    });
   } finally {
     clearTimeout(timeout);
   }
@@ -205,147 +265,72 @@ function normalizeIntelEntry(entry, defaults = {}) {
   };
 }
 
-function inferDomain(text) {
-  if (/求职|简历|岗位|面试|招聘|internship|resume|job matching|recruit|hiring/i.test(text)) return "求职与招聘服务";
-  if (/签证|移民|出海|海外|visa|immigration|cross-border|go global|global expansion/i.test(text)) return "跨境与出海服务";
-  if (/电商|商品|店铺|e-?commerce|marketplace|store/i.test(text)) return "电商与交易服务";
-  if (/教育|课程|培训|学生|education|course|training|student/i.test(text)) return "教育服务";
-  return "通用创业服务";
-}
-
-function inferTargetUser(text) {
-  const patterns = [
-    /(大学生|应届生|自由职业者|小微商家|中小企业|家长|教师|开发者|跨境卖家|创业者|students?|graduates?|freelancers?|small businesses?|smbs?|parents?|teachers?|developers?|sellers?)/i,
-    /(?:为|给|帮助|面向|针对)([^，。,.]{2,18})(?:提供|解决|做|找|，|。|,)/,
-    /(?:for|help|serve|target)\s+([a-z0-9\s-]{3,32})\s+(?:with|to|by|who|and|,|\.|$)/i,
-  ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return match[1] || match[0];
-  }
-  return "待进一步细分用户";
-}
-
-function inferProblem(text) {
-  const match = text.match(/(?:不知道|难以|很难|无法|痛点|问题是|struggle to|hard to|difficult to|can't|cannot|problem is)([^。！？!?]{3,80})/i);
-  return match ? compact(match[0], 70) : compact(text, 70);
-}
-
-function inferMarketType(domain, text) {
-  if (/求职|招聘|教育培训|外卖|电商|recruit|job|edtech|food delivery|e-?commerce/i.test(text)) return "国内偏红海：竞争密集，需强差异化切入。";
-  if (/出海|非洲|中东|拉美|africa|middle east|latam|southeast asia|overseas/i.test(text)) return "区域错位机会：国内红海场景在新兴市场可能出现蓝海窗口。";
-  if (domain === "跨境与出海服务") return "中性市场：合规与本地化能力决定壁垒。";
-  return "中性偏红：先验证细分需求，避免大而全。";
-}
-
-function buildDifferentiation(domain, text) {
-  if (/求职|简历|岗位|internship|resume|job matching|hiring/i.test(text)) {
-    return [
-      "从“写简历工具”升级为“拿到面试结果工具”：围绕面试邀约率优化，而不是只做文本润色。",
-      "建立岗位匹配解释层：给出匹配分和不匹配原因（技能缺口、项目缺口、经历映射）。",
-      "聚焦单一场景先做深：例如“应届生互联网产品岗”，用细分领域模型形成壁垒。",
-    ];
-  }
-  if (/签证|出海|海外|visa|immigration|cross-border|go global/i.test(text)) {
-    return [
-      "以“任务完成率”而非“信息罗列”做产品：把申请流程拆成节点并自动检查缺失材料。",
-      "绑定官方渠道链接和更新监控，突出“版本及时性”和“流程准确率”。",
-      "针对单一国家+单一签证类型先打透，再横向复制。",
-    ];
-  }
-  return [
-    "选择一个细分用户群作为滩头市场，先拿到可复用的成交案例。",
-    "围绕一个核心指标做产品（例如转化率、复购率、处理时长），避免功能堆砌。",
-    "通过数据反馈闭环形成壁垒：每次服务结果反哺推荐策略与运营策略。",
-  ];
-}
-
-function buildMonetization(domain, text) {
-  if (/求职|招聘|简历|internship|resume|job matching|recruit/i.test(text)) {
-    return [
-      "B2C 订阅：按月会员（简历优化+岗位匹配+投递策略）。",
-      "按结果付费：拿到面试邀约后收取成功服务费。",
-      "B2B2C：与高校就业中心/培训机构合作，按席位授权。",
-    ];
-  }
-  if (/签证|出海|海外|visa|immigration|cross-border|go global/i.test(text)) {
-    return [
-      "按申请流程收费：基础版（自助）+专业版（材料审查辅导）。",
-      "企业套餐：为出海团队提供批量流程管理与合规提醒。",
-      "生态分成：与翻译、保险、海外服务商合作分佣。",
-    ];
-  }
-  return [
-    "订阅制：稳定现金流，适合持续服务类产品。",
-    "交易抽佣：适合撮合型平台，和业务规模联动。",
-    "企业年费：适合 B2B 场景，便于长期续约。",
-  ];
-}
-
-function buildGoGlobal(text) {
-  if (/非洲|出海|海外|africa|overseas|cross-border|go global/i.test(text)) {
-    return "可行，但必须先完成国家级落地验证：先选 1 个国家、1 个行业、1 个渠道伙伴，再做本地支付、语言和合规适配。";
-  }
-  return "若国内竞争过于激烈，可做“区域错位”：优先评估东南亚/非洲的同类需求成熟度、支付能力和合规门槛，再决定是否出海。";
-}
-
-function buildExecutionLinks(text) {
-  const links = [];
-  if (/新西兰|new zealand|\bnz\b/i.test(text) && /签证|visa/i.test(text)) {
-    links.push({ label: "新西兰移民局官方签证入口", url: "https://www.immigration.govt.nz/new-zealand-visas" });
-    links.push({ label: "新西兰签证在线申请（RealMe 登录）", url: "https://www.immigration.govt.nz/new-zealand-visas/apply-for-a-visa" });
-  }
-  if (/非洲|africa|出海|海外|overseas|go global|cross-border/i.test(text)) {
-    links.push({ label: "ITC Trade Map（全球进出口数据）", url: "https://www.trademap.org/" });
-    links.push({ label: "世界银行开放数据（市场与宏观指标）", url: "https://data.worldbank.org/" });
-    links.push({ label: "UN Comtrade（国际贸易数据）", url: "https://comtradeplus.un.org/" });
-  }
-  if (/api|接口|对接|integration|sdk/i.test(text)) {
-    links.push({ label: "RapidAPI Hub（可用第三方 API 市场）", url: "https://rapidapi.com/hub" });
-    links.push({ label: "Public APIs Index（公共 API 列表）", url: "https://github.com/public-apis/public-apis" });
-  }
-  if (!links.length && /visa|签证/i.test(text)) {
-    links.push({ label: "IATA Travel Centre（签证与入境要求）", url: "https://www.iatatravelcentre.com/" });
-  }
-  if (!links.length) {
-    links.push({ label: "Google News 行业检索", url: "https://news.google.com/" });
-  }
-  return links.slice(0, 8);
-}
-
 function classifyLinkSource(url) {
-  if (/\.gov|immigration\.govt\.nz|europa\.eu/i.test(url)) return "official";
-  if (/worldbank|trademap|comtrade|statista|oecd|imf/i.test(url)) return "database";
-  if (/news|reuters|bloomberg/i.test(url)) return "news";
-  if (/rapidapi|public-apis|github/i.test(url)) return "database";
-  return "news";
+  if (/\.gov|immigration\.govt\.nz|europa\.eu|pboc\.gov|cbirc|samr\.gov/i.test(url)) return "official";
+  if (/worldbank|trademap|comtrade|oecd|imf|wikipedia|wikidata/i.test(url)) return "database";
+  if (/news|reuters|bloomberg|36kr|caixin|ft\.com/i.test(url)) return "news";
+  if (/rapidapi|github|hn\.algolia|ycombinator/i.test(url)) return "social";
+  return "curated";
 }
 
-function buildIntelFromExecutionLinks(message) {
-  const links = buildExecutionLinks(message);
-  return links.map((item) => {
-    const sourceType = classifyLinkSource(item.url);
-    return normalizeIntelEntry({
-      source: "Heigen curated source",
-      sourceType,
-      title: item.label,
-      url: item.url,
-      confidence: sourceTierByType(sourceType).weight,
-      snippet: "基于你的场景推荐的高优先级数据源/官方入口。",
-    });
-  });
+function hardConstraints(message) {
+  const hits = [];
+  if (/和ChatGPT完全一样|没有差异化|clone (of )?chatgpt|generic chatbot/i.test(message)) hits.push("无差异化复制现有巨头产品");
+  if (/没有技术|无技术背景|不会写代码|团队就我一个人/.test(message)) hits.push("交付与团队能力不足");
+  if (/没有用户|零用户|也没有用户/.test(message)) hits.push("零用户零证据");
+  if (/免费给所有人|靠广告赚钱/.test(message)) hits.push("免费+广告的单位经济通常不成立");
+  if (/信用卡|放贷|支付牌照|持牌|Brex/i.test(message)) hits.push("强监管/持牌金融，资本与牌照门槛极高");
+  if (/所有人|everybody|everyone/i.test(message) && /用户|target|customer/i.test(message)) hits.push("用户定义过宽");
+  return hits;
+}
+
+function extractSearchQueries(message) {
+  const queries = [];
+  const push = (item) => {
+    const value = compact(String(item || "").replace(/\s+/g, " ").trim(), 42);
+    if (value && !queries.includes(value)) queries.push(value);
+  };
+
+  if (/brex|企业信用卡|费用管理/i.test(message)) {
+    push("Brex funding valuation expense management");
+    push("中国 企业信用卡 支付牌照 费用管理 融资");
+  }
+  if (/求职|招聘|简历|job matching/i.test(message)) {
+    push("校园招聘 AI 求职 竞品 融资");
+    if (/非洲|africa/i.test(message)) push("Africa job matching startup market");
+  }
+  if (/ChatGPT|通用聊天机器人/i.test(message)) {
+    push("ChatGPT clone startup failure unit economics");
+  }
+  if (/签证|visa/i.test(message)) push("签证服务 创业 监管 市场");
+
+  const tokens = [...message.matchAll(/[A-Za-z][A-Za-z0-9+\-]{2,24}|[\u4e00-\u9fff]{2,8}/g)]
+    .map((match) => match[0])
+    .filter((token) => !/^(我想|一个|没有|这个|我们|进行|如果|以及|或者|可以|需要|帮我|请给|方向|项目|创业)$/.test(token));
+  if (tokens.length) push(tokens.slice(0, 6).join(" "));
+  if (!queries.length) push(compact(message, 36));
+  return queries.slice(0, 3);
+}
+
+function countryHints(message) {
+  if (/中国|国内|china/i.test(message)) return ["CHN"];
+  if (/肯尼亚|kenya/i.test(message)) return ["KEN"];
+  if (/尼日利亚|nigeria/i.test(message)) return ["NGA"];
+  if (/南非|south africa/i.test(message)) return ["ZAF"];
+  if (/非洲|africa/i.test(message)) return ["NGA", "KEN", "ZAF"];
+  if (/美国|united states|\busa\b/i.test(message)) return ["USA"];
+  return ["CHN"];
 }
 
 async function fetchGoogleNews(query) {
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans`;
-  const response = await fetchWithTimeout(url, { headers: { "User-Agent": "Heigen-Adviser/1.0" } });
+  const response = await fetchWithTimeout(url, {}, 10000);
   if (!response.ok) return [];
   const xml = await response.text();
-  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)].slice(0, 5);
+  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)].slice(0, 4);
   return items.map((match) => normalizeIntelEntry({
     source: "Google News",
     sourceType: "news",
-    confidence: 0.72,
     title: pickTag(match[1], "title"),
     url: pickTag(match[1], "link"),
     publishedAt: pickTag(match[1], "pubDate"),
@@ -353,123 +338,108 @@ async function fetchGoogleNews(query) {
   })).filter((entry) => entry.title && entry.url);
 }
 
-async function fetchRedditRss(query) {
-  const url = `https://www.reddit.com/search.rss?q=${encodeURIComponent(query)}&sort=new`;
-  const response = await fetchWithTimeout(url, { headers: { "User-Agent": "Heigen-Adviser/1.0" } });
-  if (!response.ok) return [];
-  const xml = await response.text();
-  const items = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/gi)].slice(0, 4);
-  return items.map((match) => normalizeIntelEntry({
-    source: "Reddit",
-    sourceType: "social",
-    confidence: 0.4,
-    title: pickTag(match[1], "title"),
-    url: pickTag(match[1], "id"),
-    publishedAt: pickTag(match[1], "updated"),
-    snippet: compact(pickTag(match[1], "content"), 140),
-  })).filter((entry) => entry.title && entry.url);
-}
-
 async function fetchHackerNews(query) {
   const url = `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(query)}&tags=story&hitsPerPage=5`;
-  const response = await fetchWithTimeout(url, { headers: { "User-Agent": "Heigen-Adviser/1.0" } });
+  const response = await fetchWithTimeout(url);
   if (!response.ok) return [];
   const data = await response.json();
   return (data.hits || []).map((item) => normalizeIntelEntry({
     source: "Hacker News",
     sourceType: "social",
-    confidence: 0.45,
     title: item.title || item.story_title || "",
     url: item.url || `https://news.ycombinator.com/item?id=${item.objectID}`,
     publishedAt: item.created_at || "",
-    snippet: compact(item._highlightResult?.title?.value || item.title || "", 140),
+    snippet: compact(item.title || "", 140),
   })).filter((entry) => entry.title && entry.url);
 }
 
-async function fetchXRecent(query) {
-  if (!X_BEARER_TOKEN) return [];
-  const requestUrl = `https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(query)}&max_results=10&tweet.fields=created_at&expansions=author_id&user.fields=username`;
-  const response = await fetchWithTimeout(requestUrl, {
-    headers: {
-      Authorization: `Bearer ${X_BEARER_TOKEN}`,
-      "User-Agent": "Heigen-Adviser/1.0",
-    },
-  }, 9000);
-  if (!response.ok) return [];
-  const data = await response.json();
-  const users = new Map((data.includes?.users || []).map((user) => [user.id, user]));
-  return (data.data || []).slice(0, 4).map((tweet) => {
-    const user = users.get(tweet.author_id);
-    return normalizeIntelEntry({
-      source: "X",
-      sourceType: "social",
-      confidence: 0.42,
-      title: compact(tweet.text || "", 90),
-      url: user?.username ? `https://x.com/${user.username}/status/${tweet.id}` : `https://x.com/i/web/status/${tweet.id}`,
-      publishedAt: tweet.created_at || "",
-      snippet: compact(tweet.text || "", 150),
-    });
-  }).filter((entry) => entry.title && entry.url);
-}
-
-function flatRelatedTopics(topics) {
-  if (!Array.isArray(topics)) return [];
-  const result = [];
-  for (const topic of topics) {
-    if (topic.Topics) result.push(...flatRelatedTopics(topic.Topics));
-    else result.push(topic);
+async function fetchWikipedia(query) {
+  const endpoints = [
+    `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&utf8=1&format=json&srlimit=1`,
+    `https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&utf8=1&format=json&srlimit=1`,
+  ];
+  for (const searchUrl of endpoints) {
+    try {
+      const searchResp = await fetchWithTimeout(searchUrl);
+      if (!searchResp.ok) continue;
+      const searchData = await searchResp.json();
+      const hit = searchData?.query?.search?.[0];
+      if (!hit?.title) continue;
+      const origin = searchUrl.startsWith("https://zh.") ? "https://zh.wikipedia.org" : "https://en.wikipedia.org";
+      const summaryUrl = `${origin}/api/rest_v1/page/summary/${encodeURIComponent(hit.title)}`;
+      const summaryResp = await fetchWithTimeout(summaryUrl);
+      if (!summaryResp.ok) continue;
+      const summary = await summaryResp.json();
+      if (!summary?.extract || !summary?.content_urls?.desktop?.page) continue;
+      return [normalizeIntelEntry({
+        source: "Wikipedia",
+        sourceType: "database",
+        title: summary.title || hit.title,
+        url: summary.content_urls.desktop.page,
+        snippet: compact(summary.extract, 180),
+      })];
+    } catch {
+      continue;
+    }
   }
-  return result;
+  return [];
 }
 
-async function fetchDuckDuckGo(query) {
-  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&no_redirect=1`;
-  const response = await fetchWithTimeout(url, { headers: { "User-Agent": "Heigen-Adviser/1.0" } });
-  if (!response.ok) return [];
-  const data = await response.json();
-  const records = [];
-  if (data.AbstractURL && data.AbstractText) {
-    records.push(normalizeIntelEntry({
-      source: "DuckDuckGo",
+async function fetchWorldBank(message) {
+  const countries = countryHints(message);
+  const results = [];
+  for (const code of countries.slice(0, 2)) {
+    const url = `https://api.worldbank.org/v2/country/${code}/indicator/NY.GDP.MKTP.CD?format=json&mrnev=1`;
+    const response = await fetchWithTimeout(url);
+    if (!response.ok) continue;
+    const data = await response.json();
+    const row = Array.isArray(data) ? data[1]?.[0] : null;
+    if (!row?.value || !row?.country?.value) continue;
+    const trillionUsd = (Number(row.value) / 1e12).toFixed(2);
+    results.push(normalizeIntelEntry({
+      source: "World Bank",
       sourceType: "database",
-      confidence: 0.58,
-      title: data.Heading || query,
-      url: data.AbstractURL,
-      publishedAt: "",
-      snippet: compact(data.AbstractText, 120),
+      title: `${row.country.value} GDP ${row.date}：约 ${trillionUsd} 万亿美元`,
+      url: `https://data.worldbank.org/indicator/NY.GDP.MKTP.CD?locations=${code}`,
+      publishedAt: `${row.date}-12-31`,
+      snippet: `世界银行最新可获得 GDP（现价美元）为 ${Number(row.value).toLocaleString("en-US")}。这是宏观规模，不是你的 TAM。`,
+      confidence: 0.9,
     }));
   }
-  const related = flatRelatedTopics(data.RelatedTopics).slice(0, 3);
-  for (const topic of related) {
-    if (!topic.FirstURL || !topic.Text) continue;
-    records.push(normalizeIntelEntry({
-      source: "DuckDuckGo",
-      sourceType: "database",
-      confidence: 0.56,
-      title: compact(topic.Text, 72),
-      url: topic.FirstURL,
-      publishedAt: "",
-      snippet: compact(topic.Text, 120),
-    }));
+  return results;
+}
+
+async function fetchGdelt(query) {
+  const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(query)}&mode=ArtList&maxrecords=4&format=json&timespan=6m`;
+  const response = await fetchWithTimeout(url, {}, 10000);
+  if (!response.ok) return [];
+  const data = await response.json();
+  return (data.articles || []).map((item) => normalizeIntelEntry({
+    source: item.domain || "GDELT",
+    sourceType: "news",
+    title: item.title || "",
+    url: item.url || "",
+    publishedAt: item.seendate || "",
+    snippet: compact(item.title || "", 140),
+  })).filter((entry) => entry.title && entry.url);
+}
+
+function buildExecutionLinks(message) {
+  const links = [];
+  if (/新西兰|new zealand|\bnz\b/i.test(message) && /签证|visa/i.test(message)) {
+    links.push({ label: "新西兰移民局官方签证入口", url: "https://www.immigration.govt.nz/new-zealand-visas" });
   }
-  return records;
-}
-
-function extractQuery(message) {
-  const clipped = message.replace(/\s+/g, " ").trim();
-  if (!clipped) return "startup market trends";
-  return compact(clipped, 80);
-}
-
-async function gatherMarketIntel(message) {
-  const query = extractQuery(message);
-  const tasks = [fetchGoogleNews(query), fetchDuckDuckGo(query), fetchHackerNews(query), fetchRedditRss(query), fetchXRecent(query)];
-  const settled = await Promise.allSettled(tasks);
-  const liveIntel = settled.flatMap((item) => (item.status === "fulfilled" ? item.value : []));
-  const curatedIntel = buildIntelFromExecutionLinks(message);
-  const merged = dedupeIntel([...liveIntel, ...curatedIntel]);
-  const ranked = merged.sort((a, b) => scoreIntel(b) - scoreIntel(a));
-  return ranked.slice(0, INTEL_MAX_ITEMS);
+  if (/信用卡|支付|Brex|清结算/i.test(message)) {
+    links.push({ label: "中国人民银行 支付业务许可公示", url: "https://www.pbc.gov.cn/" });
+    links.push({ label: "国家金融监督管理总局", url: "https://www.nfra.gov.cn/" });
+  }
+  if (/非洲|africa|出海/i.test(message)) {
+    links.push({ label: "世界银行开放数据", url: "https://data.worldbank.org/" });
+  }
+  if (/融资|估值|轮次/.test(message)) {
+    links.push({ label: "SEC EDGAR 公开披露检索", url: "https://www.sec.gov/edgar/search/" });
+  }
+  return links.slice(0, 6);
 }
 
 function dedupeIntel(entries) {
@@ -488,9 +458,32 @@ function dedupeIntel(entries) {
 function scoreIntel(entry) {
   const tierBoost = Math.max(0, 1 - (entry.sourceTier - 1) * 0.08);
   const recencyBoost = entry.publishedAt
-    ? Math.max(0, 1 - ((Date.now() - new Date(entry.publishedAt).getTime()) / (1000 * 60 * 60 * 24 * 30)))
+    ? Math.max(0, 1 - ((Date.now() - new Date(entry.publishedAt).getTime()) / (1000 * 60 * 60 * 24 * 90)))
     : 0.2;
   return (entry.confidence * 0.8) + (tierBoost * 0.12) + (recencyBoost * 0.08);
+}
+
+async function gatherMarketIntel(message) {
+  const queries = extractSearchQueries(message);
+  const primary = queries[0];
+  const tasks = [
+    fetchHackerNews(primary),
+    fetchWikipedia(primary),
+    fetchWorldBank(message),
+    fetchGdelt(primary),
+    fetchGoogleNews(primary),
+  ];
+  if (queries[1]) tasks.push(fetchHackerNews(queries[1]), fetchWikipedia(queries[1]));
+  const settled = await Promise.allSettled(tasks);
+  const liveIntel = settled.flatMap((item) => (item.status === "fulfilled" ? item.value : []));
+  const curated = buildExecutionLinks(message).map((item) => normalizeIntelEntry({
+    source: "Heigen curated source",
+    sourceType: classifyLinkSource(item.url),
+    title: item.label,
+    url: item.url,
+    snippet: "场景相关入口，不是市场规模或融资事实。",
+  }));
+  return dedupeIntel([...liveIntel, ...curated]).sort((a, b) => scoreIntel(b) - scoreIntel(a)).slice(0, INTEL_MAX_ITEMS);
 }
 
 function rankedSourceOverview() {
@@ -505,10 +498,12 @@ function rankedSourceOverview() {
 
 function availableSourceProviders() {
   return [
-    { key: "google-news-rss", enabled: true, type: "news", authRequired: false },
-    { key: "duckduckgo", enabled: true, type: "database", authRequired: false },
+    { key: "world-bank", enabled: true, type: "database", authRequired: false },
+    { key: "wikipedia", enabled: true, type: "database", authRequired: false },
+    { key: "gdelt", enabled: true, type: "news", authRequired: false },
     { key: "hacker-news", enabled: true, type: "social", authRequired: false },
-    { key: "reddit-rss", enabled: true, type: "social", authRequired: false },
+    { key: "google-news-rss", enabled: true, type: "news", authRequired: false },
+    { key: "qwen-enable-search", enabled: Boolean(DASHSCOPE_KEY) && ENABLE_WEB_SEARCH, type: "news", authRequired: true },
     { key: "x-recent-search", enabled: Boolean(X_BEARER_TOKEN), type: "social", authRequired: true },
   ];
 }
@@ -516,78 +511,121 @@ function availableSourceProviders() {
 function availableModelProviders() {
   return [
     {
+      key: "tongyi-dashscope",
+      enabled: Boolean(DASHSCOPE_KEY),
+      requiresKey: true,
+      model: OPENAI_MODEL,
+      baseUrl: OPENAI_BASE_URL,
+      search: ENABLE_WEB_SEARCH,
+      note: "通义千问（DashScope 兼容模式）。未配置真实 DASHSCOPE_API_KEY 时禁用。",
+    },
+    {
       key: "ollama",
       enabled: Boolean(OLLAMA_MODEL),
       requiresKey: false,
       model: OLLAMA_MODEL || "",
       baseUrl: OLLAMA_BASE_URL,
-      note: "本地模型，零 API 成本（需本机运行 Ollama）",
-    },
-    {
-      key: "openai-compatible",
-      enabled: Boolean(process.env.OPENAI_API_KEY),
-      requiresKey: true,
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      baseUrl: OPENAI_BASE_URL,
-      note: "支持 OpenAI 兼容接口（可切换到国内兼容服务）",
+      note: "仅当本机确有模型名且可连通时才应启用",
     },
     {
       key: "anthropic",
-      enabled: Boolean(process.env.ANTHROPIC_API_KEY),
+      enabled: Boolean(ANTHROPIC_KEY),
       requiresKey: true,
-      model: process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest",
-      baseUrl: "https://api.anthropic.com/v1/messages",
-      note: "高质量兜底模型",
+      model: ANTHROPIC_MODEL,
+      note: "未配置真实密钥时禁用",
     },
   ];
 }
 
-async function callModelProvider(provider, prompt) {
-  if (provider === "ollama") return callOllama(prompt);
-  if (provider === "openai") return callOpenAI(prompt);
-  if (provider === "anthropic") return callAnthropic(prompt);
-  return null;
-}
-
 function safeJsonParse(raw) {
   if (!raw) return null;
+  const asObject = (value) => (value && typeof value === "object" && !Array.isArray(value) ? value : null);
   try {
-    return JSON.parse(raw);
+    const direct = asObject(JSON.parse(raw));
+    if (direct) return direct;
   } catch {
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    try {
-      return JSON.parse(match[0]);
-    } catch {
-      return null;
-    }
+    // continue to brace extraction
+  }
+  const match = String(raw).match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    return asObject(JSON.parse(match[0]));
+  } catch {
+    return null;
   }
 }
 
-async function callOpenAI(payload) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return null;
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+function collectSearchCitations(payload) {
+  const buckets = [
+    payload?.search_info?.search_results,
+    payload?.choices?.[0]?.message?.search_info?.search_results,
+  ].filter(Boolean);
+  const results = [];
+  for (const list of buckets) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      results.push(normalizeIntelEntry({
+        source: item.site_name || item.source || "Qwen Search",
+        sourceType: classifyLinkSource(item.url || ""),
+        title: item.title || "",
+        url: item.url || "",
+        snippet: compact(item.snippet || item.title || "通义联网检索结果", 160),
+      }));
+    }
+  }
+  return results.filter((item) => item.title && item.url);
+}
+
+async function callTongyi(messages, { jsonMode = true } = {}) {
+  if (!DASHSCOPE_KEY) return { error: "未配置 DASHSCOPE_API_KEY，通义未接通。" };
+  const body = {
+    model: OPENAI_MODEL,
+    temperature: 0.3,
+    max_tokens: 4096,
+    messages,
+    enable_search: ENABLE_WEB_SEARCH,
+  };
+  if (ENABLE_WEB_SEARCH) {
+    body.search_options = {
+      forced_search: true,
+      enable_source: true,
+      enable_citation: true,
+    };
+  }
+  if (jsonMode) body.response_format = { type: "json_object" };
+
   const response = await fetchWithTimeout(`${OPENAI_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${DASHSCOPE_KEY}`,
     },
-    body: JSON.stringify({
-      model,
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages: payload,
-    }),
-  }, 15000);
-  if (!response.ok) return null;
-  const data = await response.json();
-  return safeJsonParse(data?.choices?.[0]?.message?.content || "");
+    body: JSON.stringify(body),
+  }, 60000);
+
+  const rawText = await response.text();
+  if (!response.ok) {
+    return { error: `通义接口 ${response.status}：${compact(rawText, 240)}` };
+  }
+  let payload;
+  try {
+    payload = JSON.parse(rawText);
+  } catch {
+    return { error: "通义返回不是合法 JSON。" };
+  }
+  const content = payload?.choices?.[0]?.message?.content || "";
+  const parsed = jsonMode ? safeJsonParse(content) : { content };
+  if (!parsed) return { error: "通义未返回可解析的顾问 JSON。", raw: compact(content, 400) };
+  return {
+    data: parsed,
+    citations: collectSearchCitations(payload),
+    provider: "tongyi",
+    model: payload?.model || OPENAI_MODEL,
+  };
 }
 
-async function callOllama(payload) {
-  if (!OLLAMA_MODEL) return null;
+async function callOllama(messages) {
+  if (!OLLAMA_MODEL) return { error: "未配置 OLLAMA_MODEL" };
   const response = await fetchWithTimeout(`${OLLAMA_BASE_URL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -595,150 +633,229 @@ async function callOllama(payload) {
       model: OLLAMA_MODEL,
       stream: false,
       format: "json",
-      options: { temperature: 0.2 },
-      messages: payload,
+      options: { temperature: 0.3 },
+      messages,
     }),
-  }, 20000);
-  if (!response.ok) return null;
+  }, 25000);
+  if (!response.ok) return { error: `Ollama ${response.status}` };
   const data = await response.json();
-  const content = data?.message?.content || "";
-  return safeJsonParse(content);
+  const parsed = safeJsonParse(data?.message?.content || "");
+  if (!parsed) return { error: "Ollama 未返回可解析 JSON" };
+  return { data: parsed, citations: [], provider: "ollama", model: OLLAMA_MODEL };
 }
 
-async function callAnthropic(payload) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
-  const model = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest";
-  const system = payload.find((item) => item.role === "system")?.content || "";
-  const messages = payload.filter((item) => item.role !== "system");
+async function callAnthropic(messages) {
+  if (!ANTHROPIC_KEY) return { error: "未配置 ANTHROPIC_API_KEY" };
+  const system = messages.find((item) => item.role === "system")?.content || "";
+  const rest = messages.filter((item) => item.role !== "system");
   const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": apiKey,
+      "x-api-key": ANTHROPIC_KEY,
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model,
-      max_tokens: 1200,
-      temperature: 0.2,
+      model: ANTHROPIC_MODEL,
+      max_tokens: 4096,
+      temperature: 0.3,
       system,
-      messages,
+      messages: rest,
     }),
-  }, 15000);
-  if (!response.ok) return null;
+  }, 45000);
+  if (!response.ok) return { error: `Anthropic ${response.status}` };
   const data = await response.json();
   const text = (data.content || []).map((item) => item.text || "").join("\n");
-  return safeJsonParse(text);
+  const parsed = safeJsonParse(text);
+  if (!parsed) return { error: "Anthropic 未返回可解析 JSON" };
+  return { data: parsed, citations: [], provider: "anthropic", model: ANTHROPIC_MODEL };
 }
 
-function buildSystemPrompt() {
+async function callModelProvider(provider, messages) {
+  if (provider === "openai" || provider === "tongyi") {
+    const first = await callTongyi(messages, { jsonMode: true });
+    if (extractAdvicePayload(first.data)) return first;
+    const retry = await callTongyi(messages, { jsonMode: false });
+    if (retry.data) {
+      const parsed = extractAdvicePayload(safeJsonParse(retry.data.content || "")) || extractAdvicePayload(retry.data);
+      if (parsed) return { ...retry, data: parsed };
+      if (typeof retry.data.content === "string" && retry.data.content.trim()) {
+        return {
+          ...retry,
+          data: {
+            verdict: "narrow",
+            verdictReason: "模型未输出结构化 JSON，以下为原文，按投资人标准暂作强制收窄。",
+            content: retry.data.content,
+          },
+        };
+      }
+    }
+    return {
+      error: [first.error, retry.error, first.raw ? `raw:${first.raw}` : "", retry.raw ? `retry:${retry.raw}` : ""]
+        .filter(Boolean)
+        .join(" | ") || "通义未返回顾问结论",
+    };
+  }
+  if (provider === "ollama") return callOllama(messages);
+  if (provider === "anthropic") return callAnthropic(messages);
+  return { error: `未知模型通道 ${provider}` };
+}
+
+function buildSystemPrompt(mode) {
+  const cache = loadSkillCache();
+  const modeExtra = mode === "qa"
+    ? cache.questions
+    : mode === "bp"
+      ? cache.bp
+      : mode === "pitch"
+        ? cache.pitch
+        : cache.validation;
+
   return [
-    "你是黑根（Heigen）创业商业顾问。",
-    "目标：先给结论和方案，再最多问一个关键补充问题。",
-    "禁止审判用户、禁止长篇问卷、禁止空泛鼓励。",
-    "必须输出可执行建议：商业价值、红海蓝海判断、差异化、变现、出海策略、7/30/90天计划。",
-    "引用联网信息时遵守来源权重：official > database > news > social；社交来源只能作为早期信号。",
-    "如果用户提到签证/API/官方入口，必须给具体可点击链接。",
-    "若信息不足，做合理假设并标注“假设前提”。",
-    "输出严格 JSON，字段为：content、assessment、executionLinks、optionalQuestion。",
-    "assessment 需要 targetUsers/coreProblem/evidenceState/nextAction 字段。",
-  ].join("\n");
+    "你是黑根（Heigen），按早期投资人和创业大赛评委标准做顾问，不是人生导师。",
+    "必须加载并遵守以下 SKILL 与参考资料。",
+    cache.skill,
+    modeExtra ? `\n## 当前模式参考\n${modeExtra}` : "",
+    "—— 投资人硬规则 ——",
+    "1. 允许且必须否决：无差异化复制、无交付能力、零证据、强监管却无牌照/无资本、单位经济算不平。",
+    "2. 禁止默认说“这个方向有商业机会”。没有证据时优先 kill / pivot / narrow。",
+    "3. 数字必须标注 cited 或 assumption。禁止编造融资轮次、估值、用户数、牌照状态。",
+    "4. 单位经济必须给：单价、单位成本、毛利率、CAC、回本月数、启动资金人民币区间、18个月烧钱、死亡线指标。",
+    "5. 引用联网信息时 official > database > news > social；社交只作早期信号。",
+    "6. 先给投资人结论，再给理由、数字、下一步实验；最多一个补充问题。",
+    "7. 禁止编造法规条文号、通报编号、判例名称、融资轮次或精确估值。不确定就写待核验，并给出应去哪个官网核对。",
+    "8. 只输出严格 JSON，字段：verdict, verdictReason, content, assessment, unitEconomics, market, executionLinks, optionalQuestion。",
+    "verdict 只能是 kill | pivot | narrow | proceed。",
+    "assessment 含 targetUsers, coreProblem, evidenceState, nextAction。",
+    "unitEconomics 含 price, cogs, grossMargin, cac, paybackMonths, ltv, startingCapitalCny{low,high,basis,includes}, burn18mCny, killMetrics。",
+    "market 含 type(red|blue|neutral), tamSamSom{tam,sam,som,source,status}, competitors[], fundingSignals[]。",
+    "content 为给创业者看的中文 Markdown，必须包含：投资人结论、否决/收窄理由、单位经济、资金、竞品、证据缺口、7/30/90天（若已否决则改成退出或转向动作）。",
+  ].filter(Boolean).join("\n");
 }
 
-function buildUserPrompt({ mode, message, history, intel }) {
+function buildUserPrompt({ mode, message, history, intel, constraints }) {
   const historyTail = history.slice(-6).map((item) => `${item.role}: ${item.content}`).join("\n");
   const intelText = intel.length
-    ? intel.map((item, index) => `[${index + 1}] ${item.title} | ${item.source} | ${item.sourceType} | confidence=${item.confidence} | ${item.url}`).join("\n")
-    : "暂无实时情报";
+    ? intel.map((item, index) => `[${index + 1}] ${item.title} | ${item.source} | ${item.sourceType} | ${item.url} | ${item.snippet}`).join("\n")
+    : "本地检索未拿到可用条目；不要假装有数据，标为待核验。";
   return [
     `模式: ${mode}`,
     `用户输入: ${message}`,
+    constraints.length ? `硬约束信号（必须在 verdict 中显式处理）: ${constraints.join("；")}` : "硬约束信号: 无自动标记，仍按投资人标准独立判断。",
     `历史上下文:\n${historyTail || "无"}`,
-    `联网情报:\n${intelText}`,
-    "请直接给出：",
-    "1) 商业价值判断（明确结论）",
-    "2) 市场判断（红海/蓝海+依据）",
-    "3) 差异化打法（至少3条）",
-    "4) 赚钱路径（至少3条）",
-    "5) 出海可行性与国家切入建议",
-    "6) 7/30/90天执行方案",
-    "7) 最多一个补充问题（可选）",
-    "8) 结论优先使用高权重来源（official > database > news > social）",
+    `已检索情报:\n${intelText}`,
+    "请直接给出投资人级判断，而不是鼓励性套话。",
   ].join("\n\n");
 }
 
-function heuristicAdvice({ mode, message, intel }) {
-  const domain = inferDomain(message);
-  const targetUsers = inferTargetUser(message);
-  const coreProblem = inferProblem(message);
-  const marketType = inferMarketType(domain, message);
-  const differentiation = buildDifferentiation(domain, message);
-  const monetization = buildMonetization(domain, message);
-  const goGlobal = buildGoGlobal(message);
-  const executionLinks = buildExecutionLinks(message);
+function emptyEconomics() {
+  return {
+    price: { value: "", basis: "assumption", note: "" },
+    cogs: { value: "", basis: "assumption", note: "" },
+    grossMargin: { value: "", basis: "assumption", note: "" },
+    cac: { value: "", basis: "assumption", note: "" },
+    paybackMonths: { value: "", basis: "assumption", note: "" },
+    ltv: { value: "", basis: "assumption", note: "" },
+    startingCapitalCny: { low: 0, high: 0, basis: "assumption", includes: [] },
+    burn18mCny: { value: "", basis: "assumption", note: "" },
+    killMetrics: [],
+  };
+}
 
-  const modeBlock = mode === "bp"
-    ? [
-      "**BP落地建议（先做这三件）**：",
-      "1. 先写执行摘要一句话：用户是谁、问题是什么、你如何解决、为什么你赢。",
-      "2. 先定财务假设最小集合：单价、单位成本、首月获客量、毛利。",
-      "3. 市场部分先用“可验证小市场”而不是大而空的 TAM。",
-    ]
-    : mode === "pitch"
-      ? [
-        "**路演落地建议（优先改）**：",
-        "1. 开场15秒只讲痛点场景，不讲功能。",
-        "2. 第3分钟前必须给出至少一个验证证据。",
-        "3. 结尾给清晰诉求：要资源、资金还是渠道。",
-      ]
-      : mode === "qa"
-        ? [
-          "**答辩策略（评委视角）**：",
-          "1. 每个回答先给结论，再给证据，不要先解释背景。",
-          "2. 对未知问题直接承认，并给验证计划和时间点。",
-          "3. 防守重点：付费意愿、获客成本、可复制增长。",
-        ]
-        : [];
+function normalizeEconomics(raw) {
+  const base = emptyEconomics();
+  if (!raw || typeof raw !== "object") return base;
+  return {
+    ...base,
+    ...raw,
+    startingCapitalCny: {
+      ...base.startingCapitalCny,
+      ...(raw.startingCapitalCny || {}),
+    },
+  };
+}
 
-  const content = [
-    "先给你结论：这个方向有商业机会，但前提是你必须把“大而泛”的功能改成“结果导向”的细分场景产品。",
-    "",
-    `**商业价值判断**：${domain}存在真实需求，尤其当你能直接提升用户可感知结果（如求职邀约率、申请通过率、成交效率）时，具备付费基础。`,
-    `**市场判断（红海/蓝海）**：${marketType}`,
-    "**差异化打法**：",
-    ...differentiation.map((item, index) => `${index + 1}. ${item}`),
-    "",
-    "**赚钱模型**：",
-    ...monetization.map((item, index) => `${index + 1}. ${item}`),
-    "",
-    `**出海建议**：${goGlobal}`,
-    "**7/30/90 天执行方案**：",
-    "1. 7天：锁定一个细分用户群，做10-15次访谈，验证最高频痛点和现有替代方案。",
-    "2. 30天：上线最小可用版本，只保留一个核心结果指标，跑首批真实用户。",
-    "3. 90天：根据数据决定加价、扩渠道或转向，并形成可复用的增长模型。",
-    "",
-    ...modeBlock,
-    ...(modeBlock.length ? [""] : []),
-    intel.length ? `**最新行业线索**：已同步 ${intel.length} 条联网信息，优先跟进与你赛道最相关的2-3条。` : "**最新行业线索**：当前未抓到稳定外部信息，建议稍后重试联网检索。",
-    "",
-    "假设前提：以上建议基于你当前描述，未包含你尚未披露的成本结构与实际转化数据。",
-  ].join("\n");
+function extractAdvicePayload(data) {
+  if (!data || typeof data !== "object") return null;
+  if (data.verdict || data.content) return data;
+  if (data.output && typeof data.output === "object") return extractAdvicePayload(data.output);
+  if (data.result && typeof data.result === "object") return extractAdvicePayload(data.result);
+  return null;
+}
 
-  const optionalQuestion = mode === "qa"
-    ? "如果只能证明一个指标来打动评委，你准备证明“用户愿意付费”还是“用户持续留存”？"
-    : "你希望我先帮你落地哪一段：差异化方案、变现方案，还是出海落地计划？";
+function normalizeAdvice(llm, { message, intel }) {
+  const verdict = ["kill", "pivot", "narrow", "proceed"].includes(llm?.verdict) ? llm.verdict : "narrow";
+  const assessment = llm?.assessment || {};
+  return {
+    verdict,
+    verdictLabel: VERDICT_LABELS[verdict],
+    verdictReason: llm?.verdictReason || "模型未给出明确否决/推进理由，按投资人标准视为强制收窄。",
+    content: llm?.content || "模型没有返回可读结论。",
+    optionalQuestion: llm?.optionalQuestion || "",
+    assessment: {
+      targetUsers: assessment.targetUsers || "未定义滩头用户",
+      coreProblem: assessment.coreProblem || compact(message, 80),
+      evidenceState: assessment.evidenceState || "证据不足",
+      nextAction: assessment.nextAction || "先补证据，再谈方案",
+    },
+    unitEconomics: normalizeEconomics(llm?.unitEconomics),
+    market: {
+      type: ["red", "blue", "neutral"].includes(llm?.market?.type) ? llm.market.type : "neutral",
+      tamSamSom: llm?.market?.tamSamSom || { tam: "", sam: "", som: "", source: "", status: "assumption" },
+      competitors: Array.isArray(llm?.market?.competitors) ? llm.market.competitors.slice(0, 6) : [],
+      fundingSignals: Array.isArray(llm?.market?.fundingSignals) ? llm.market.fundingSignals.slice(0, 6) : [],
+    },
+    executionLinks: Array.isArray(llm?.executionLinks) ? llm.executionLinks.filter((item) => item?.url).slice(0, 8) : [],
+    intel,
+  };
+}
+
+async function generateAdvice({ mode, message, history, intel }) {
+  const constraints = hardConstraints(message);
+  const prompt = [
+    { role: "system", content: buildSystemPrompt(mode) },
+    { role: "user", content: buildUserPrompt({ mode, message, history, intel, constraints }) },
+  ];
+
+  const errors = [];
+  for (const provider of MODEL_PROVIDER_ORDER) {
+    try {
+      const result = await callModelProvider(provider, prompt);
+      const advicePayload = extractAdvicePayload(result?.data);
+      if (advicePayload) {
+        const advice = normalizeAdvice(advicePayload, { message, intel });
+        const mergedIntel = dedupeIntel([...(result.citations || []), ...intel]).slice(0, INTEL_MAX_ITEMS);
+        advice.intel = mergedIntel;
+        advice.executionLinks = mergeExecutionLinks(advice.executionLinks, buildExecutionLinks(message));
+        return {
+          ok: true,
+          advice,
+          model: {
+            connected: true,
+            provider: result.provider,
+            model: result.model,
+            search: ENABLE_WEB_SEARCH,
+          },
+        };
+      }
+      if (result?.error) errors.push(`${provider}: ${result.error}`);
+      else if (result?.data) errors.push(`${provider}: 返回 JSON 缺少 verdict/content：${compact(JSON.stringify(result.data), 220)}`);
+      else errors.push(`${provider}: 空响应`);
+    } catch (error) {
+      errors.push(`${provider}: ${error.message || "调用失败"}`);
+    }
+  }
 
   return {
-    content,
-    optionalQuestion,
-    assessment: {
-      targetUsers,
-      coreProblem,
-      evidenceState: /访谈|试点|收入|订单|客户|数据/.test(message) ? "已有初步证据，建议补强样本质量" : "证据不足，需先做小规模验证",
-      nextAction: "优先定义单一细分用户 + 单一核心结果指标，再开展 7 天验证",
+    ok: false,
+    error: "真实模型未接通，已拒绝返回模板化安慰剂建议。",
+    details: errors,
+    model: {
+      connected: false,
+      provider: "",
+      model: OPENAI_MODEL,
+      search: ENABLE_WEB_SEARCH,
     },
-    executionLinks,
   };
 }
 
@@ -754,48 +871,6 @@ function mergeExecutionLinks(primary, fallback) {
   return merged;
 }
 
-function ensureStructuredContent(content, fallbackContent) {
-  const required = ["商业价值判断", "市场判断（红海/蓝海）", "差异化打法", "赚钱模型", "7/30/90"];
-  if (content && required.every((token) => content.includes(token))) return content;
-  if (!content) return fallbackContent;
-  return `${fallbackContent}\n\n**模型补充判断**：${compact(content, 520)}`;
-}
-
-async function generateAdvice({ mode, message, history, intel }) {
-  const fallback = heuristicAdvice({ mode, message, intel });
-  const prompt = [
-    { role: "system", content: buildSystemPrompt() },
-    { role: "user", content: buildUserPrompt({ mode, message, history, intel }) },
-  ];
-
-  let llm = null;
-  for (const provider of MODEL_PROVIDER_ORDER) {
-    if (llm) break;
-    try {
-      llm = await callModelProvider(provider, prompt);
-    } catch {
-      llm = null;
-    }
-  }
-
-  if (llm && llm.content && llm.assessment) {
-    const structuredContent = ensureStructuredContent(llm.content, fallback.content);
-    return {
-      content: structuredContent,
-      optionalQuestion: llm.optionalQuestion || fallback.optionalQuestion,
-      assessment: {
-        targetUsers: llm.assessment.targetUsers || fallback.assessment.targetUsers,
-        coreProblem: llm.assessment.coreProblem || fallback.assessment.coreProblem,
-        evidenceState: llm.assessment.evidenceState || fallback.assessment.evidenceState,
-        nextAction: llm.assessment.nextAction || fallback.assessment.nextAction,
-      },
-      executionLinks: mergeExecutionLinks(Array.isArray(llm.executionLinks) ? llm.executionLinks.slice(0, 8) : [], fallback.executionLinks),
-    };
-  }
-
-  return fallback;
-}
-
 function createSessionRecord({ mode = "validation", title = "" }) {
   const timestamp = nowIso();
   return {
@@ -805,6 +880,8 @@ function createSessionRecord({ mode = "validation", title = "" }) {
     createdAt: timestamp,
     updatedAt: timestamp,
     lastAssessment: null,
+    lastVerdict: null,
+    lastEconomics: null,
     messages: [],
   };
 }
@@ -813,9 +890,23 @@ function getSession(store, sessionId) {
   return store.sessions.find((session) => session.id === sessionId);
 }
 
+function modelStatusPayload() {
+  const providers = availableModelProviders();
+  const active = providers.find((item) => item.enabled);
+  return {
+    connected: Boolean(active),
+    active: active ? { key: active.key, model: active.model, search: ENABLE_WEB_SEARCH } : null,
+    order: MODEL_PROVIDER_ORDER,
+    providers,
+    note: active
+      ? "已接通真实模型。失败时不会回退到“永远有机会”的模板。"
+      : "未接通真实模型。请在 .env 填写 DASHSCOPE_API_KEY 后重启。",
+  };
+}
+
 async function apiHandler(req, res, pathname) {
   if (req.method === "GET" && pathname === "/api/health") {
-    sendJson(res, 200, { ok: true, now: nowIso() });
+    sendJson(res, 200, { ok: true, now: nowIso(), model: modelStatusPayload() });
     return;
   }
 
@@ -823,17 +914,13 @@ async function apiHandler(req, res, pathname) {
     sendJson(res, 200, {
       ranking: rankedSourceOverview(),
       providers: availableSourceProviders(),
-      note: "建议优先采用官方与数据库来源，社交来源仅用于发现早期信号。",
+      note: "官方与数据库优先；通义 enable_search 负责补充行业与融资公开信息。社交来源只作早期信号。",
     });
     return;
   }
 
   if (req.method === "GET" && pathname === "/api/model/providers") {
-    sendJson(res, 200, {
-      order: MODEL_PROVIDER_ORDER,
-      providers: availableModelProviders(),
-      note: "推荐国内低成本方案：ollama(qwen) 为主，openai-compatible(通义/DeepSeek) 为辅，anthropic 兜底。",
-    });
+    sendJson(res, 200, modelStatusPayload());
     return;
   }
 
@@ -848,6 +935,7 @@ async function apiHandler(req, res, pathname) {
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         messageCount: session.messages.length,
+        verdict: session.lastVerdict?.verdict || "",
       }));
     sendJson(res, 200, { sessions });
     return;
@@ -894,13 +982,48 @@ async function apiHandler(req, res, pathname) {
       return;
     }
 
+    const status = modelStatusPayload();
+    if (!status.connected) {
+      sendJson(res, 503, {
+        error: "真实模型未接通。请在项目 .env 填写 DASHSCOPE_API_KEY（阿里云百炼通义密钥）后重启 node server.js。",
+        model: status,
+      });
+      return;
+    }
+
     const intel = await gatherMarketIntel(text).catch(() => []);
+    const preview = await readStore();
+    const existing = getSession(preview, body.sessionId);
+    let generated;
+    try {
+      generated = await generateAdvice({
+        mode: body.mode || existing?.mode || "validation",
+        message: text,
+        history: existing?.messages || [],
+        intel,
+      });
+    } catch (error) {
+      sendJson(res, 502, { error: error.message || "模型调用失败", model: status });
+      return;
+    }
+
+    if (!generated.ok) {
+      sendJson(res, 502, {
+        error: generated.error,
+        details: generated.details,
+        model: generated.model,
+      });
+      return;
+    }
+
     const result = await withStore(async (store) => {
       let session = getSession(store, body.sessionId);
       if (!session) {
         session = createSessionRecord({ mode: body.mode || "validation", title: `黑根咨询-${body.mode || "validation"}` });
         store.sessions.push(session);
       }
+
+      const advice = generated.advice;
       const userEntry = {
         id: makeId("msg"),
         role: "user",
@@ -909,13 +1032,6 @@ async function apiHandler(req, res, pathname) {
         metadata: { mode: body.mode || session.mode, timezone: body.timezone || "" },
       };
       session.messages.push(userEntry);
-
-      const advice = await generateAdvice({
-        mode: body.mode || session.mode,
-        message: text,
-        history: session.messages,
-        intel,
-      });
 
       const assistantContent = advice.optionalQuestion
         ? `${advice.content}\n\n关键补充问题：${advice.optionalQuestion}`
@@ -927,15 +1043,21 @@ async function apiHandler(req, res, pathname) {
         content: assistantContent,
         createdAt: nowIso(),
         metadata: {
+          verdict: { verdict: advice.verdict, label: advice.verdictLabel, reason: advice.verdictReason },
           assessment: advice.assessment,
+          unitEconomics: advice.unitEconomics,
+          market: advice.market,
           executionLinks: advice.executionLinks,
-          intel,
+          intel: advice.intel,
+          model: generated.model,
         },
       };
       session.messages.push(assistantEntry);
       session.lastAssessment = advice.assessment;
+      session.lastVerdict = { verdict: advice.verdict, label: advice.verdictLabel, reason: advice.verdictReason };
+      session.lastEconomics = advice.unitEconomics;
       session.updatedAt = nowIso();
-      return { session, assistant: advice, intel };
+      return { session, advice, model: generated.model };
     });
 
     sendJson(res, 200, {
@@ -944,8 +1066,9 @@ async function apiHandler(req, res, pathname) {
         mode: result.session.mode,
         title: result.session.title,
       },
-      assistant: result.assistant,
-      intel: result.intel,
+      assistant: result.advice,
+      intel: result.advice.intel,
+      model: result.model,
     });
     return;
   }
@@ -991,11 +1114,15 @@ async function handleRequest(req, res) {
 }
 
 if (require.main === module) {
+  loadSkillCache();
   const server = http.createServer(handleRequest);
   server.listen(PORT, () => {
+    const status = modelStatusPayload();
     console.log(`Heigen server running at http://localhost:${PORT}`);
+    console.log(`Model connected: ${status.connected} ${status.active ? `${status.active.key}/${status.active.model}` : "(missing DASHSCOPE_API_KEY)"}`);
   });
 }
 
 module.exports = handleRequest;
 module.exports.handleRequest = handleRequest;
+module.exports.modelStatusPayload = modelStatusPayload;
