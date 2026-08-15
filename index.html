@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="黑根 AI 创业计划指导顾问" />
+    <title>黑根 · 创业计划指导顾问</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#" aria-label="黑根首页">
+          <span class="brand-mark">H</span>
+          <span>黑根<small>HEIGEN</small></span>
+        </a>
+        <p class="sidebar-copy">按投资人标准判断项目：允许否决，数字必须有依据。</p>
+        <div class="model-status" id="model-status">正在检测通义连接…</div>
+        <nav class="mode-nav" aria-label="顾问模式">
+          <button class="mode-card active" data-mode="validation">
+            <span class="mode-icon">◎</span>
+            <span><strong>验证想法</strong><small>先判断值不值得做</small></span>
+          </button>
+          <button class="mode-card" data-mode="bp">
+            <span class="mode-icon">▤</span>
+            <span><strong>梳理 BP</strong><small>七段商业计划书</small></span>
+          </button>
+          <button class="mode-card" data-mode="pitch">
+            <span class="mode-icon">◒</span>
+            <span><strong>准备路演</strong><small>五分钟说清楚</small></span>
+          </button>
+          <button class="mode-card" data-mode="qa">
+            <span class="mode-icon">?</span>
+            <span><strong>模拟答辩</strong><small>评委压力测试</small></span>
+          </button>
+        </nav>
+        <div class="sidebar-bottom">
+          <button class="text-button" id="new-session">+ 新建咨询</button>
+          <button class="text-button" id="clear-history">清除本地记录</button>
+          <p>未接通通义时不会给出模板安慰剂。建议不构成法律、财税或投资意见。</p>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="mode-label">创意与商业模式验证</p>
+            <h1 id="page-title">先问：这个项目值不值得把命押上去？</h1>
+          </div>
+          <button class="export-button" id="export-session">导出本次咨询</button>
+        </header>
+
+        <section class="progress-panel" aria-label="咨询进度">
+          <div class="progress-copy">
+            <span id="stage-label">投资人审查</span>
+            <strong id="progress-text">先给否决/收窄/推进结论，再最小化追问。</strong>
+          </div>
+          <div class="progress-track"><span id="progress-bar"></span></div>
+        </section>
+
+        <section class="chat" id="chat" aria-live="polite"></section>
+
+        <section class="quick-actions" id="quick-actions" aria-label="快捷输入"></section>
+
+        <form class="composer" id="composer">
+          <label class="sr-only" for="user-input">输入你的创业信息</label>
+          <textarea
+            id="user-input"
+            rows="3"
+            placeholder="直接说项目、用户、竞争和你手上的证据。没有证据也可以，黑根会按投资人标准处理。"
+            required
+          ></textarea>
+          <button type="submit" id="send-button">发送 <span>↵</span></button>
+        </form>
+      </section>
+
+      <aside class="insight-panel">
+        <div class="panel-heading">
+          <p class="eyebrow">投资人看板</p>
+          <h2>当前判断</h2>
+        </div>
+        <div class="verdict-card" id="verdict-card" hidden>
+          <span id="verdict-kicker">投资人结论</span>
+          <strong id="verdict-label">待判断</strong>
+          <p id="verdict-reason"></p>
+        </div>
+        <div class="signal-card">
+          <span>当前模式</span>
+          <strong id="board-mode">验证想法</strong>
+        </div>
+        <dl id="venture-board" class="venture-board">
+          <div><dt>目标用户</dt><dd>待确认</dd></div>
+          <div><dt>核心问题</dt><dd>待确认</dd></div>
+          <div><dt>当前证据</dt><dd>待收集</dd></div>
+          <div><dt>下一动作</dt><dd>输入项目方向</dd></div>
+        </dl>
+        <div class="econ-panel">
+          <p class="eyebrow">单位经济 / 资金</p>
+          <dl id="econ-board" class="venture-board">
+            <div><dt>启动资金</dt><dd>待模型计算</dd></div>
+            <div><dt>毛利 / CAC</dt><dd>待模型计算</dd></div>
+            <div><dt>18 个月烧钱</dt><dd>待模型计算</dd></div>
+            <div><dt>死亡线</dt><dd>待模型计算</dd></div>
+          </dl>
+        </div>
+        <div class="rubric">
+          <p class="eyebrow">评委视角</p>
+          <p id="rubric-tip">没有来源的数字都是假设。没有证据的故事，默认不值得出价。</p>
+        </div>
+      </aside>
+    </main>
+    <template id="message-template">
+      <article class="message">
+        <div class="avatar"></div>
+        <div class="message-content">
+          <p class="message-name"></p>
+          <div class="message-text"></div>
+        </div>
+      </article>
+    </template>
+    <script src="app.js"></script>
+  </body>
+</html>

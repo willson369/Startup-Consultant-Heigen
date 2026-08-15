@@ -1,0 +1,10 @@
+{
+  "name": "heigen-startup-advisor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Heigen enterprise-style startup advisor web app",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  }
+}

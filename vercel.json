@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "functions": {
+    "api/[...path].js": {
+      "maxDuration": 60,
+      "includeFiles": "skills/**"
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/api/[...path].js"
+    },
+    {
+      "handle": "filesystem"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/index.html"
+    }
+  ]
+}
